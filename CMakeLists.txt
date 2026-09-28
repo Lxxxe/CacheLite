@@ -51,6 +51,7 @@ cachelite_enable_sanitizers(cachelite_server)
 # POSIX sockets. Keep the base target buildable on other hosts.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_library(cachelite_net STATIC
+        src/net/EpollPoller.cpp
         src/net/InetAddress.cpp
         src/net/Socket.cpp
     )
@@ -79,6 +80,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     cachelite_set_warnings(cachelite_blocking_echo)
     cachelite_enable_sanitizers(cachelite_blocking_echo)
+
+    add_executable(cachelite_epoll_echo
+        src/server/epoll_echo_main.cpp
+    )
+
+    target_link_libraries(cachelite_epoll_echo
+        PRIVATE
+            cachelite_net
+    )
+
+    cachelite_set_warnings(cachelite_epoll_echo)
+    cachelite_enable_sanitizers(cachelite_epoll_echo)
 endif()
 
 if(CACHELITE_BUILD_TESTS)

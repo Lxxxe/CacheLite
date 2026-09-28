@@ -1,6 +1,7 @@
 #include "cachelite/net/Socket.h"
 
 #include <cerrno>
+#include <fcntl.h>
 #include <system_error>
 #include <utility>
 
@@ -30,7 +31,10 @@ Socket::~Socket() {
         ::close(fd_);
     }
 }
-
+//std::exchange(other.fd_, -1)
+//1. 把 `other.fd_` 当前的值（socket 文件描述符）**先保存下来**；
+//2. 将 `other.fd_` 赋值为 `-1`（-1 代表无效 fd）；
+//3. 返回刚才保存的旧 fd。
 Socket::Socket(Socket&& other) noexcept
     : fd_(std::exchange(other.fd_, -1)) {
 }
@@ -62,6 +66,31 @@ void Socket::setReuseAddress(bool enabled) {
             errno,
             std::generic_category(),
             "setsockopt SO_REUSEADDR"
+        );
+    }
+}
+
+void Socket::setNonBlocking(bool enabled) {
+    const int currentFlags = ::fcntl(fd_, F_GETFL, 0);//获取 fd 当前的文件状态标志F_GETFL
+    if (currentFlags < 0) {
+        throw std::system_error(
+            errno,
+            std::generic_category(),
+            "fcntl F_GETFL"
+        );
+    }
+
+    //`O_NONBLOCK` 是一个宏，二进制里只有某一位是 1，其余都是 0.开启还是关闭 `O_NONBLOCK` 标志
+    const int newFlags = enabled
+        ? currentFlags | O_NONBLOCK//把 O_NONBLOCK 这一位强制置 1:开启非阻塞
+        : currentFlags & ~O_NONBLOCK;//把 O_NONBLOCK 这一位强制清 0:关闭非阻塞
+
+        //将新flags设置回去
+    if (::fcntl(fd_, F_SETFL, newFlags) < 0) {
+        throw std::system_error(
+            errno,
+            std::generic_category(),
+            "fcntl F_SETFL"
         );
     }
 }
@@ -114,6 +143,38 @@ std::pair<Socket, InetAddress> Socket::accept() {
         Socket(clientFd),//包装客户端fd成Socket对象
         InetAddress(peer)//用已经被内核填充好的peer，构造InetAddress对象
     };
+}
+
+std::optional<std::pair<Socket, InetAddress>> Socket::acceptNonBlocking() {
+    sockaddr_in peer{};
+    socklen_t peerLength = static_cast<socklen_t>(sizeof(peer));
+
+    const int clientFd = ::accept(
+        fd_,
+        reinterpret_cast<sockaddr*>(&peer),
+        &peerLength
+    );
+    //EAGAIN / EWOULDBLOCK非阻塞 socket，当前没有待接受的新连接,`EINTR`：系统调用被信号中断。也不算致命错误
+    if (clientFd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return std::nullopt;
+        }
+        //如果 errno 不是上面这几个，代表**真的出错**
+        throw std::system_error(
+            errno,
+            std::generic_category(),
+            "accept"
+        );
+    }
+
+    Socket client(clientFd);
+    client.setNonBlocking();
+
+    //有新连接成功：返回 `std::optional` 里面包着 `pair<Socket, InetAddress>`（新客户端 socket + 客户端地址）
+    return std::make_pair(
+        std::move(client),
+        InetAddress(peer)
+    );
 }
 //void* buffer接收数据的内存位置,size最多读取多少字节
 ssize_t Socket::read(void* buffer, std::size_t size) {
