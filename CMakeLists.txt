@@ -35,6 +35,49 @@ target_compile_definitions(cachelite_core
 cachelite_set_warnings(cachelite_core)
 cachelite_enable_sanitizers(cachelite_core)
 
+add_library(cachelite_buffer STATIC
+    src/net/Buffer.cpp
+)
+
+target_include_directories(cachelite_buffer
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+cachelite_set_warnings(cachelite_buffer)
+cachelite_enable_sanitizers(cachelite_buffer)
+
+add_library(cachelite_protocol STATIC
+    src/protocol/RespEncoder.cpp
+    src/protocol/RespParser.cpp
+    src/protocol/RespValue.cpp
+)
+
+target_include_directories(cachelite_protocol
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(cachelite_protocol
+    PUBLIC
+        cachelite_buffer
+)
+
+cachelite_set_warnings(cachelite_protocol)
+cachelite_enable_sanitizers(cachelite_protocol)
+
+add_library(cachelite_storage STATIC
+    src/storage/MemoryStore.cpp
+)
+
+target_include_directories(cachelite_storage
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+cachelite_set_warnings(cachelite_storage)
+cachelite_enable_sanitizers(cachelite_storage)
+
 add_executable(cachelite_server
     src/server/main.cpp
 )
@@ -64,6 +107,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(cachelite_net
         PUBLIC
             cachelite_core
+            cachelite_buffer
     )
 
     cachelite_set_warnings(cachelite_net)
@@ -92,6 +136,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     cachelite_set_warnings(cachelite_epoll_echo)
     cachelite_enable_sanitizers(cachelite_epoll_echo)
+
+    add_executable(cachelite_resp_epoll
+        src/server/resp_epoll_main.cpp
+    )
+
+    target_link_libraries(cachelite_resp_epoll
+        PRIVATE
+            cachelite_net
+            cachelite_protocol
+            cachelite_storage
+    )
+
+    cachelite_set_warnings(cachelite_resp_epoll)
+    cachelite_enable_sanitizers(cachelite_resp_epoll)
 endif()
 
 if(CACHELITE_BUILD_TESTS)
