@@ -5,12 +5,16 @@
 #include "cachelite/protocol/RespEncoder.h"
 #include "cachelite/protocol/RespParser.h"
 #include "cachelite/protocol/RespValue.h"
+#include "cachelite/storage/MemoryStore.h"
 
 #include <array>
+#include <charconv>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -27,6 +31,7 @@ using cachelite::protocol::RespEncoder;
 using cachelite::protocol::RespParseStatus;
 using cachelite::protocol::RespParser;
 using cachelite::protocol::RespValue;
+using cachelite::storage::MemoryStore;
 
 struct ClientConnection {
     Socket socket;
@@ -51,7 +56,20 @@ std::string upper(std::string_view text) {
     return result;
 }
 
-RespValue dispatchCommand(const RespValue& request) {
+std::optional<std::int64_t> parseInteger(std::string_view text) {
+    std::int64_t value = 0;
+    const auto [end, result] = std::from_chars(
+        text.data(),
+        text.data() + text.size(),
+        value
+    );
+    if (result != std::errc{} || end != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+RespValue dispatchCommand(MemoryStore& store, const RespValue& request) {
     //Redis 命令的标准传输格式必须是非空的 RESP 数组（`*` 开头）
     if (request.type != RespValue::Type::Array || request.elements.empty()) {
         return RespValue::error("ERR command must be a non-empty RESP array");
@@ -87,10 +105,79 @@ RespValue dispatchCommand(const RespValue& request) {
         return RespValue::bulkString(request.elements[1].text);
     }
 
+    if (command == "SET") {
+        if (request.elements.size() != 3) {
+            return RespValue::error("ERR wrong number of arguments for 'set'");
+        }
+
+        store.set(
+            request.elements[1].text,
+            request.elements[2].text
+        );
+        return RespValue::simpleString("OK");
+    }
+
+    if (command == "GET") {
+        if (request.elements.size() != 2) {
+            return RespValue::error("ERR wrong number of arguments for 'get'");
+        }
+
+        const auto value = store.get(request.elements[1].text);
+        if (!value.has_value()) {
+            return RespValue::nullBulkString();
+        }
+
+        return RespValue::bulkString(*value);
+    }
+
+    if (command == "DEL") {
+        if (request.elements.size() < 2) {
+            return RespValue::error("ERR wrong number of arguments for 'del'");
+        }
+
+        std::int64_t removed = 0;
+        for (std::size_t index = 1; index < request.elements.size(); ++index) {
+            if (store.del(request.elements[index].text)) {
+                ++removed;
+            }
+        }
+        return RespValue::integerValue(removed);
+    }
+
+    if (command == "EXPIRE") {
+        if (request.elements.size() != 3) {
+            return RespValue::error(
+                "ERR wrong number of arguments for 'expire'"
+            );
+        }
+
+        const auto seconds = parseInteger(request.elements[2].text);
+        if (!seconds.has_value()) {
+            return RespValue::error("ERR invalid expire time");
+        }
+
+        return RespValue::integerValue(
+            store.expire(
+                request.elements[1].text,
+                std::chrono::seconds(*seconds)
+            ) ? 1 : 0
+        );
+    }
+
+    if (command == "TTL") {
+        if (request.elements.size() != 2) {
+            return RespValue::error("ERR wrong number of arguments for 'ttl'");
+        }
+
+        return RespValue::integerValue(
+            store.ttlSeconds(request.elements[1].text)
+        );
+    }
+
     return RespValue::error("ERR unknown command '" + command + "'");
 }
 
-void processRequests(ClientConnection& client) {
+void processRequests(ClientConnection& client, MemoryStore& store) {
     RespParser parser;
 
     while (!client.closeAfterWrite) {
@@ -115,12 +202,14 @@ void processRequests(ClientConnection& client) {
             client.closeAfterWrite = true;
             return;
         }
-        //dispatchCommand(request)命令分发
-        client.output += RespEncoder::encode(dispatchCommand(request));//RespEncoder::encode转换成 RESP 字节：并追加到output
+        // 命令分发，并把响应编码后追加到 output。
+        client.output += RespEncoder::encode(
+            dispatchCommand(store, request)
+        );
     }
 }
 
-void readAvailable(ClientConnection& client) {
+void readAvailable(ClientConnection& client, MemoryStore& store) {
     std::array<char, 4096> buffer{};
 
     while (!client.closeAfterWrite) {
@@ -135,7 +224,7 @@ void readAvailable(ClientConnection& client) {
                 buffer.data(),
                 static_cast<std::size_t>(count)
             );
-            processRequests(client);//解析请求
+            processRequests(client, store);//解析请求
             continue;
         }
 
@@ -201,6 +290,7 @@ int main() {
         EpollPoller poller;
         poller.add(listenSocket.fd(), EPOLLIN);
         std::unordered_map<int, ClientConnection> clients;
+        MemoryStore store;//服务器启动时创建一个全局内存存储对象：
 
         std::cout << "RESP epoll server listening on 127.0.0.1:6379\n";
 
@@ -248,7 +338,7 @@ int main() {
                 //只有收到可读事件，并且当前没有准备关闭连接，才去执行读回调 readAvailable
                 if ((event.events & EPOLLIN) != 0 &&
                     !client.closeAfterWrite) {//closeAfterWrite发完剩下的数据之后，就关闭这个连接
-                    readAvailable(client);
+                    readAvailable(client, store);
                 }
                 //内核发送缓冲区有空位或用户层 output 缓冲区还有残留数据没发完
                 if ((event.events & EPOLLOUT) != 0 ||
