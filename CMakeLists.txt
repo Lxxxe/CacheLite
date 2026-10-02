@@ -78,6 +78,41 @@ target_include_directories(cachelite_storage
 cachelite_set_warnings(cachelite_storage)
 cachelite_enable_sanitizers(cachelite_storage)
 
+add_library(cachelite_command STATIC
+    src/command/CommandExecutor.cpp
+)
+
+target_include_directories(cachelite_command
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(cachelite_command
+    PUBLIC
+        cachelite_protocol
+        cachelite_storage
+)
+
+cachelite_set_warnings(cachelite_command)
+cachelite_enable_sanitizers(cachelite_command)
+
+add_library(cachelite_persistence STATIC
+    src/persistence/AofLog.cpp
+)
+
+target_include_directories(cachelite_persistence
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(cachelite_persistence
+    PUBLIC
+        cachelite_command
+)
+
+cachelite_set_warnings(cachelite_persistence)
+cachelite_enable_sanitizers(cachelite_persistence)
+
 add_executable(cachelite_server
     src/server/main.cpp
 )
@@ -144,8 +179,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(cachelite_resp_epoll
         PRIVATE
             cachelite_net
-            cachelite_protocol
-            cachelite_storage
+            cachelite_command
+            cachelite_persistence
     )
 
     cachelite_set_warnings(cachelite_resp_epoll)
