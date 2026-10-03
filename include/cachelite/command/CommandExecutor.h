@@ -1,7 +1,7 @@
 #pragma once
 
+#include "cachelite/cache/CacheService.h"
 #include "cachelite/protocol/RespValue.h"
-#include "cachelite/storage/MemoryStore.h"
 
 #include <vector>
 
@@ -22,7 +22,7 @@ struct CommandResult {
 class CommandExecutor {
 public:
     //使用 explicit 防止隐式构造
-    explicit CommandExecutor(storage::MemoryStore& store) noexcept;
+    explicit CommandExecutor(cache::CacheService& cache) noexcept;
 
     [[nodiscard]] CommandResult execute(
         const protocol::RespValue& request,
@@ -30,7 +30,7 @@ public:
     );
 
 private:
-    storage::MemoryStore& store_;
+    cache::CacheService& cache_;
 };
 
 }  // namespace cachelite::command

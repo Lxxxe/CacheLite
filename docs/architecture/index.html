@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CacheLite · 整体架构</title>
+  <style>
+    :root{--bg:#09111f;--panel:#111d31;--panel2:#152640;--line:#2d4669;--text:#e8f0ff;--muted:#9db0ca;--cyan:#57d7ff;--green:#67e0a3;--orange:#ffbd70;--purple:#c2a4ff}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--text);background:radial-gradient(circle at 15% 0,#19335b 0,transparent 33rem),radial-gradient(circle at 85% 12%,#20314f 0,transparent 28rem),var(--bg);font:15px/1.7 Inter,"Noto Sans SC","Microsoft YaHei",sans-serif}
+    a{color:var(--cyan);text-decoration:none}.wrap{width:min(1180px,calc(100% - 36px));margin:auto}.hero{padding:70px 0 42px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.15em;text-transform:uppercase}h1{margin:10px 0 12px;font-size:clamp(36px,7vw,68px);line-height:1.08;letter-spacing:-.04em}.lead{max-width:780px;margin:0;color:var(--muted);font-size:18px}.badges{display:flex;flex-wrap:wrap;gap:9px;margin-top:24px}.badge{padding:5px 11px;border:1px solid var(--line);border-radius:999px;color:#c8d7ee;background:#111d31bb;font-size:12px}
+    nav{position:sticky;top:0;z-index:5;border-block:1px solid var(--line);background:#09111fd9;backdrop-filter:blur(14px)}nav .wrap{display:flex;gap:20px;overflow:auto;padding:10px 0}nav a{white-space:nowrap;color:var(--muted);font-size:13px}section{padding:54px 0 0}h2{margin:0 0 9px;font-size:28px;letter-spacing:-.025em}h3{margin:0 0 7px;font-size:17px}.intro{margin:0 0 22px;color:var(--muted)}.panel,.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(145deg,#152640eb,#0e1a2deb);box-shadow:0 18px 50px #0000003d}.panel{padding:22px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{padding:20px;background:#111d31bf;box-shadow:none}.card p,.card ul{margin:8px 0 0;color:var(--muted)}.card ul{padding-left:19px}.tag{display:inline-block;margin-bottom:12px;padding:2px 8px;border-radius:6px;background:#57d7ff1f;color:var(--cyan);font-size:11px;font-weight:700}.green{color:var(--green);background:#67e0a31c}.orange{color:var(--orange);background:#ffbd701c}.purple{color:var(--purple);background:#c2a4ff1c}.flow{display:grid;grid-template-columns:1fr 30px 1fr 30px 1fr;align-items:center;gap:8px}.node{min-height:82px;display:flex;flex-direction:column;justify-content:center;padding:12px;text-align:center;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}.node small{color:var(--muted);font-size:11px}.arrow{color:var(--cyan);text-align:center;font-size:24px}.callout{margin-top:16px;padding:14px 16px;border-left:3px solid var(--orange);border-radius:8px;background:#ffbd7014;color:#d8e1ef}pre{margin:0;overflow:auto;padding:18px;border:1px solid var(--line);border-radius:12px;background:#08101d;color:#cfe2fb;font:13px/1.7 ui-monospace,Consolas,monospace}.table-wrap{overflow:auto}table{width:100%;min-width:680px;border-collapse:collapse}th,td{padding:12px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--cyan);font-size:12px;letter-spacing:.06em}td{color:var(--muted)}td:first-child{color:var(--text);white-space:nowrap}.footer{padding:60px 0 48px;color:var(--muted);font-size:13px}@media(max-width:820px){.grid{grid-template-columns:1fr}.flow{grid-template-columns:1fr}.arrow{transform:rotate(90deg)}.hero{padding-top:48px}}
+  </style>
+</head>
+<body>
+  <header class="hero wrap">
+    <div class="eyebrow">CacheLite / Architecture</div>
+    <h1>一个带 MySQL 回源的<br>高并发内存 KV 服务器</h1>
+    <p class="lead">当前版本以 Linux、非阻塞 TCP、epoll 和 RESP2 子集为基础，在内存缓存之外加入 TTL、精确 LRU、AOF 持久化以及异步 MySQL read-through。</p>
+    <div class="badges"><span class="badge">C++17</span><span class="badge">Linux x86-64</span><span class="badge">非阻塞 TCP</span><span class="badge">epoll Reactor</span><span class="badge">RESP2 子集</span><span class="badge">MySQL 连接池</span></div>
+  </header>
+  <nav><div class="wrap"><a href="#overview">总览</a><a href="#modules">模块</a><a href="#get">GET 链路</a><a href="#threads">线程模型</a><a href="#data">数据与持久化</a><a href="#layout">目录</a><a href="#scope">边界</a></div></nav>
+  <main class="wrap">
+    <section id="overview">
+      <h2>整体架构</h2><p class="intro">网络线程负责事件分发和响应顺序；后台线程负责可能阻塞的数据库查询。</p>
+      <div class="panel">
+        <div class="flow">
+          <div class="node"><b>客户端</b><small>nc / Redis Client</small></div><div class="arrow">→</div>
+          <div class="node"><b>Epoll Reactor</b><small>Socket · Buffer · eventfd</small></div><div class="arrow">→</div>
+          <div class="node"><b>CommandExecutor</b><small>RESP · 命令语义 · AOF</small></div>
+        </div>
+        <div class="flow" style="margin-top:20px">
+          <div class="node" style="border-color:#67e0a3"><b>MemoryStore</b><small>TTL · 精确 LRU · 最大内存</small></div><div class="arrow">↕</div>
+          <div class="node"><b>CacheService</b><small>内存访问 · 异步任务队列</small></div><div class="arrow">↕</div>
+          <div class="node" style="border-color:#c2a4ff"><b>MySQLRepository</b><small>Connection Pool · cache_entries</small></div>
+        </div>
+        <div class="callout">GET 未命中时走 CacheService 的 worker 线程查询 MySQL；完成结果通过 CompletionQueue 和 eventfd 回到 epoll 主线程，再回填 MemoryStore。</div>
+      </div>
+    </section>
+    <section id="modules">
+      <h2>模块职责</h2><p class="intro">每层只处理自己的问题，通过接口连接，避免网络、协议、存储和数据库逻辑互相耦合。</p>
+      <div class="grid">
+        <article class="card"><span class="tag">NETWORK</span><h3>网络层</h3><p>Socket、InetAddress、Buffer、EpollPoller 封装 TCP、地址、缓冲区和 epoll。</p></article>
+        <article class="card"><span class="tag">PROTOCOL</span><h3>RESP 协议层</h3><p>RespParser 处理半包和粘包，RespEncoder 将结果编码为 RESP2 响应。</p></article>
+        <article class="card"><span class="tag">COMMAND</span><h3>命令层</h3><p>CommandExecutor 负责 SET、GET、DEL、EXPIRE、TTL 等命令语义，并生成 AOF 命令。</p></article>
+        <article class="card"><span class="tag green">CACHE</span><h3>缓存服务层</h3><p>CacheService 统一封装内存读写、后台 worker 和异步回源任务队列。</p></article>
+        <article class="card"><span class="tag green">STORAGE</span><h3>内存存储层</h3><p>MemoryStore 保存 String KV，维护 TTL、内存占用、精确 LRU 链表和超限淘汰。</p></article>
+        <article class="card"><span class="tag purple">DATABASE</span><h3>数据库层</h3><p>KeyValueRepository 定义抽象；MySQLRepository 查询；MySQLConnectionPool 复用连接。</p></article>
+        <article class="card"><span class="tag orange">PERSISTENCE</span><h3>AOF 持久化</h3><p>AofLog 追加记录修改命令，启动时重放 AOF；GET 等只读命令不会写入 AOF。</p></article>
+        <article class="card"><span class="tag">BUILD</span><h3>构建与配置</h3><p>CMake 通过 CACHELITE_ENABLE_MYSQL 控制 MySQL 功能，运行时从环境变量读取连接配置。</p></article>
+        <article class="card"><span class="tag">SCOPE</span><h3>当前边界</h3><p>当前聚焦单机 String KV；暂不包含集群、主从复制、事务、Lua、Pub/Sub 和 AOF 重写。</p></article>
+      </div>
+    </section>
+    <section id="get">
+      <h2>GET 未命中：异步 MySQL 回源</h2><p class="intro">这是当前版本最有区别于普通 MiniRedis 的业务链路：数据库查询不会阻塞 epoll 主线程。</p>
+      <div class="panel">
+        <div class="flow"><div class="node"><b>1 · 收包</b><small>epoll_wait → Socket::read</small></div><div class="arrow">→</div><div class="node"><b>2 · 解析</b><small>Buffer → RespParser</small></div><div class="arrow">→</div><div class="node"><b>3 · 查内存</b><small>CacheService → MemoryStore</small></div></div>
+        <div class="flow" style="margin-top:14px"><div class="node"><b>4 · 入队</b><small>lookupAsync → condition_variable</small></div><div class="arrow">→</div><div class="node"><b>5 · 查 MySQL</b><small>worker → Repository → Pool</small></div><div class="arrow">→</div><div class="node"><b>6 · 回通知</b><small>callback → CompletionQueue → eventfd</small></div></div>
+        <div class="flow" style="margin-top:14px"><div class="node"><b>7 · 回填</b><small>processCompletions → MemoryStore::set</small></div><div class="arrow">→</div><div class="node"><b>8 · 编码</b><small>RespEncoder → output buffer</small></div><div class="arrow">→</div><div class="node"><b>9 · 发送</b><small>EPOLLOUT → Socket::send</small></div></div>
+        <div class="callout">同一客户端回源期间由 pendingRequestId 保护响应顺序；查询完成后才继续处理该客户端后续请求。</div>
+      </div>
+    </section>
+    <section id="threads">
+      <h2>线程与事件模型</h2><p class="intro">主线程和 worker 线程各自负责不同类型的工作，通过线程安全队列与 eventfd 交接。</p>
+      <div class="grid">
+        <article class="card"><span class="tag">EPOLL THREAD</span><h3>主事件线程</h3><ul><li>等待客户端 socket 和 eventfd</li><li>读取数据、解析 RESP</li><li>处理内存命中请求</li><li>组织响应并发送数据</li></ul></article>
+        <article class="card"><span class="tag purple">WORKER THREADS</span><h3>缓存回源线程</h3><ul><li>等待 condition_variable</li><li>消费 CacheService::tasks_</li><li>借用 MySQL 连接执行查询</li><li>通过 callback 投递结果</li></ul></article>
+        <article class="card"><span class="tag green">HANDOFF</span><h3>线程安全交接</h3><ul><li>任务队列由 mutex 保护</li><li>完成队列由 mutex 保护</li><li>eventfd 唤醒 epoll 主线程</li><li>主线程独占客户端状态</li></ul></article>
+      </div>
+      <pre style="margin-top:14px">客户端 socket --(epoll)--> 主线程 --(lookupAsync)--> tasks_ --(worker)--> MySQL
+      ^                 |                                      |
+      +--(EPOLLOUT)-----+ <-- eventfd <-- CompletionQueue <-----+</pre>
+    </section>
+    <section id="data">
+      <h2>数据与持久化</h2>
+      <div class="grid">
+        <article class="card"><span class="tag green">MEMORY</span><h3>MemoryStore</h3><p>数据首先存在内存中。每个 key 关联 value、过期时间和 LRU 位置；超限后按 LRU 淘汰。</p></article>
+        <article class="card"><span class="tag orange">AOF</span><h3>appendonly.aof</h3><p>修改命令追加到 AOF。启动时由 AofLog::replay() 交给命令执行器重放。</p></article>
+        <article class="card"><span class="tag purple">MYSQL</span><h3>cache_entries</h3><p>MySQL 是缓存未命中的回源数据源。查询成功后只回填内存，不通过普通 SET 修改数据库。</p></article>
+      </div>
+      <div class="callout">当前的 MySQL 回源是 read-through：GET 未命中才查数据库，查到后回填内存；不是启动时全量加载，也不是每次 GET 都查 MySQL。</div>
+    </section>
+    <section id="layout">
+      <h2>代码目录映射</h2>
+      <div class="panel table-wrap"><table><thead><tr><th>目录 / 文件</th><th>职责</th><th>关键对象</th></tr></thead><tbody>
+        <tr><td>src/net</td><td>TCP、地址、缓冲区、epoll</td><td>Socket, Buffer, EpollPoller</td></tr>
+        <tr><td>src/protocol</td><td>RESP2 子集解析和编码</td><td>RespParser, RespEncoder, RespValue</td></tr>
+        <tr><td>src/storage</td><td>内存 KV、TTL、LRU、内存上限</td><td>MemoryStore</td></tr>
+        <tr><td>src/cache</td><td>缓存门面和异步回源队列</td><td>CacheService</td></tr>
+        <tr><td>src/database</td><td>数据库抽象、MySQL 查询、连接复用</td><td>KeyValueRepository, MySQLRepository, MySQLConnectionPool</td></tr>
+        <tr><td>src/command</td><td>命令分发和持久化命令生成</td><td>CommandExecutor</td></tr>
+        <tr><td>src/persistence</td><td>AOF 追加与启动重放</td><td>AofLog</td></tr>
+        <tr><td>src/server</td><td>组装所有模块成为 epoll 服务器</td><td>resp_epoll_main.cpp</td></tr>
+        <tr><td>docs</td><td>架构决策和 MySQL 表结构</td><td>mysql_schema.sql, architecture/README.md</td></tr>
+      </tbody></table></div>
+    </section>
+    <section id="scope">
+      <h2>当前完成度与下一步</h2>
+      <div class="grid">
+        <article class="card"><span class="tag green">已实现</span><h3>核心能力</h3><ul><li>非阻塞 TCP + epoll 多客户端</li><li>RESP 半包 / 粘包解析</li><li>String 类型 SET / GET / DEL</li><li>TTL、AOF、LRU 和最大内存限制</li><li>MySQL 异步回源和连接池</li></ul></article>
+        <article class="card"><span class="tag orange">需要加强</span><h3>工程化能力</h3><ul><li>连接健康检查与重连</li><li>回源超时、重试与熔断</li><li>同 key 请求合并，缓解缓存击穿</li><li>回源队列长度和并发限制</li><li>指标、日志和压测基准</li></ul></article>
+        <article class="card"><span class="tag purple">暂不在一期</span><h3>Redis 高级特性</h3><ul><li>集群和主从复制</li><li>事务、Lua、Pub/Sub</li><li>AOF rewrite</li><li>更多数据类型</li><li>分布式一致性协议</li></ul></article>
+      </div>
+    </section>
+  </main>
+  <footer class="footer wrap">CacheLite architecture · 文档随代码演进更新 · 可直接用浏览器打开本文件</footer>
+</body>
+</html>

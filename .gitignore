@@ -2,6 +2,7 @@
 /build/
 /build-wsl/
 /build-debug/
+/build-mysql/
 /out/
 /bin/
 /lib/

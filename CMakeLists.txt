@@ -14,9 +14,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(CACHELITE_BUILD_TESTS "Build CacheLite tests" ON)
 option(CACHELITE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(CACHELITE_ENABLE_MYSQL "Enable MySQL cache read-through" OFF)
 
 include(cmake/CacheLiteWarnings.cmake)
 include(cmake/CacheLiteSanitizers.cmake)
+
+find_package(Threads REQUIRED)
 
 add_library(cachelite_core STATIC
     src/base/BuildInfo.cpp
@@ -78,6 +81,67 @@ target_include_directories(cachelite_storage
 cachelite_set_warnings(cachelite_storage)
 cachelite_enable_sanitizers(cachelite_storage)
 
+add_library(cachelite_database STATIC
+    src/database/MySQLConnectionPool.cpp
+    src/database/MySQLRepository.cpp
+)
+
+target_include_directories(cachelite_database
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(CACHELITE_ENABLE_MYSQL)
+    find_path(CACHELITE_MYSQL_INCLUDE_DIR
+        NAMES mysql/mysql.h
+    )
+    find_library(CACHELITE_MYSQL_LIBRARY
+        NAMES mysqlclient mariadb
+    )
+
+    if(NOT CACHELITE_MYSQL_INCLUDE_DIR OR
+       NOT CACHELITE_MYSQL_LIBRARY)
+        message(FATAL_ERROR
+            "CACHELITE_ENABLE_MYSQL is ON, but MySQL client development files were not found"
+        )
+    endif()
+
+    target_compile_definitions(cachelite_database
+        PUBLIC
+            CACHELITE_ENABLE_MYSQL=1
+    )
+    target_include_directories(cachelite_database
+        PUBLIC
+            ${CACHELITE_MYSQL_INCLUDE_DIR}
+    )
+    target_link_libraries(cachelite_database
+        PUBLIC
+            ${CACHELITE_MYSQL_LIBRARY}
+    )
+endif()
+
+cachelite_set_warnings(cachelite_database)
+cachelite_enable_sanitizers(cachelite_database)
+
+add_library(cachelite_cache STATIC
+    src/cache/CacheService.cpp
+)
+
+target_include_directories(cachelite_cache
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(cachelite_cache
+    PUBLIC
+        cachelite_database
+        cachelite_storage
+        Threads::Threads
+)
+
+cachelite_set_warnings(cachelite_cache)
+cachelite_enable_sanitizers(cachelite_cache)
+
 add_library(cachelite_command STATIC
     src/command/CommandExecutor.cpp
 )
@@ -89,8 +153,8 @@ target_include_directories(cachelite_command
 
 target_link_libraries(cachelite_command
     PUBLIC
+        cachelite_cache
         cachelite_protocol
-        cachelite_storage
 )
 
 cachelite_set_warnings(cachelite_command)

@@ -79,7 +79,7 @@ MemoryStore::SetResult MemoryStore::set(
 }
 
 std::optional<std::string> MemoryStore::get(std::string_view key) {
-    const auto it = values_.find(std::string(key));
+    const auto it = values_.find(std::string(key));//unordered_map的查找
     if (it == values_.end()) {
         return std::nullopt;
     }

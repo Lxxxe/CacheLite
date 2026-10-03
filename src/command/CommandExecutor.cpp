@@ -54,8 +54,8 @@ RespValue makeCommand(
 
 namespace cachelite::command {
 
-CommandExecutor::CommandExecutor(storage::MemoryStore& store) noexcept
-    : store_(store) {//保存 MemoryStore 的引用
+CommandExecutor::CommandExecutor(cache::CacheService& cache) noexcept
+    : cache_(cache) {//保存 CacheService 的引用
 }
 
 CommandResult CommandExecutor::execute(
@@ -117,12 +117,12 @@ CommandResult CommandExecutor::execute(
             return result;
         }
         // 2. 调用内存存储，写入 key-value
-        const auto setResult = store_.set(
+        const auto setResult = cache_.set(
             request.elements[1].text,
             request.elements[2].text
         );
         //3. 判断是否超过最大内存限制，OOM保护
-        if (setResult == storage::MemoryStore::SetResult::RejectedByMaxMemory) {
+        if (setResult == cache::CacheService::SetResult::RejectedByMaxMemory) {
             result.response = RespValue::error(
                 "OOM command not allowed when used memory > 'maxmemory'"
             );
@@ -145,7 +145,7 @@ CommandResult CommandExecutor::execute(
             return result;
         }
 
-        const auto value = store_.get(request.elements[1].text);
+        const auto value = cache_.getLocal(request.elements[1].text);
         result.response = value.has_value()
             ? RespValue::bulkString(*value)
             : RespValue::nullBulkString();
@@ -162,7 +162,7 @@ CommandResult CommandExecutor::execute(
 
         std::int64_t removed = 0;
         for (std::size_t index = 1; index < request.elements.size(); ++index) {
-            if (store_.del(request.elements[index].text)) {
+            if (cache_.del(request.elements[index].text)) {
                 ++removed;
             }
         }
@@ -187,14 +187,14 @@ CommandResult CommandExecutor::execute(
             return result;
         }
 
-        const bool updated = store_.expire(
+        const bool updated = cache_.expire(
             request.elements[1].text,
             std::chrono::seconds(*seconds)
         );
         result.response = RespValue::integerValue(updated ? 1 : 0);
 
         if (record && updated) {
-            const auto expiration = store_.expirationMilliseconds(
+            const auto expiration = cache_.expirationMilliseconds(
                 request.elements[1].text
             );
             if (expiration.has_value()) {
@@ -222,7 +222,7 @@ CommandResult CommandExecutor::execute(
         }
 
         result.response = RespValue::integerValue(
-            store_.ttlSeconds(request.elements[1].text)
+            cache_.ttlSeconds(request.elements[1].text)
         );
         return result;
     }
@@ -243,7 +243,7 @@ CommandResult CommandExecutor::execute(
             return result;
         }
 
-        const bool updated = store_.expireAtMilliseconds(
+        const bool updated = cache_.expireAtMilliseconds(
             request.elements[1].text,
             *timestamp
         );
