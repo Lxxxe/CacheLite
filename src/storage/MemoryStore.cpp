@@ -93,6 +93,20 @@ std::optional<std::string> MemoryStore::get(std::string_view key) {
     return it->second.value;
 }
 
+bool MemoryStore::exists(std::string_view key) {
+    const auto it = values_.find(std::string(key));
+    if (it == values_.end()) {
+        return false;
+    }
+    if (isExpired(it->second, nowMilliseconds())) {
+        eraseEntry(it);
+        return false;
+    }
+
+    touch(it);
+    return true;
+}
+
 bool MemoryStore::del(std::string_view key) {
     const auto it = values_.find(std::string(key));
     if (it == values_.end()) {

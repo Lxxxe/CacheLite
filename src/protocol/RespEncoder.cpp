@@ -4,6 +4,7 @@
 
 namespace cachelite::protocol {
 
+    //根据RESP协议封装回应内容
 std::string RespEncoder::encode(const RespValue& value) {
     switch (value.type) {
     case RespValue::Type::SimpleString:
@@ -21,12 +22,10 @@ std::string RespEncoder::encode(const RespValue& value) {
 
     case RespValue::Type::Array: {
         std::string result = "*" +
-            std::to_string(value.elements.size()) + "\r\n";
-
+            std::to_string(value.elements.size()) + "\r\n";//value.elements是std::vector<RespValue>
         for (const RespValue& element : value.elements) {
-            result += encode(element);
+            result += encode(element);//递归
         }
-
         return result;
     }
 

@@ -38,6 +38,8 @@ public:
     [[nodiscard]] std::optional<std::string> get(
         std::string_view key
     );
+    // 判断 key 是否存在；访问会刷新 LRU，过期 key 会被清理。
+    [[nodiscard]] bool exists(std::string_view key);
     //删除 key：
     [[nodiscard]] bool del(std::string_view key);
     //设置 key 的存活时间，相对过期时间

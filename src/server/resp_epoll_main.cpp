@@ -12,6 +12,7 @@
 #include "cachelite/storage/MemoryStore.h"
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cctype>
 #include <cstddef>
@@ -31,6 +32,7 @@
 
 namespace {
 
+using cachelite::cache::CacheOptions;
 using cachelite::cache::CacheService;
 using cachelite::command::CommandExecutor;
 using cachelite::command::CommandResult;
@@ -71,13 +73,13 @@ private:
 };
 
 struct ClientConnection {
-    Socket socket;
-    Buffer input;
-    std::string output;
-    bool peerClosed{false};
-    bool closeAfterWrite{false};
-    std::optional<std::uint64_t> pendingRequestId;
-    std::uint64_t nextRequestId{0};
+    Socket socket;                                //客户端的 TCP socket，负责保存 fd，并进行 read()、send() 等操作。Socket 是 RAII 对象，连接销毁时会自动关闭 fd。
+    Buffer input;                                 //客户端输入缓冲区
+    std::string output;                           //待发送给客户端的响应数据
+    bool peerClosed{false};                       //表示客户端是否已经关闭连接
+    bool closeAfterWrite{false};                  //表示是否在输出数据发送完后关闭连接。
+    std::optional<std::uint64_t> pendingRequestId;//当前正在等待异步 MySQL 回源的请求编号
+    std::uint64_t nextRequestId{0};               //为当前客户端生成请求编号的计数器，每次异步回源请求使用后递增。
 };
 
 struct CacheCompletion {
@@ -141,9 +143,9 @@ void appendCommandResult(
 ) {
     for (const RespValue& persistenceCommand :
          result.persistenceCommands) {
-        aof.append(persistenceCommand);
+        aof.append(persistenceCommand);//把persistenceCommand编码成 RESP 格式并追加到 AOF 文件
     }
-    client.output += RespEncoder::encode(result.response);
+    client.output += RespEncoder::encode(result.response);//把响应编码到客户端输出缓冲区
 }
 
 void processRequests(
@@ -154,10 +156,10 @@ void processRequests(
     CompletionQueue& completions
 ) {
     RespParser parser;
-
+    //循环处理client.input中的命令
     while (!client.closeAfterWrite &&
            !client.pendingRequestId.has_value()) {
-        RespValue request;
+        RespValue request;//用于接收parse解析完的结果
         std::string error;
         const RespParseStatus status = parser.parse(
             client.input,
@@ -178,14 +180,14 @@ void processRequests(
             return;
         }
 
-        std::string getKey;
-        //判断是不是 GET 请求,getkey接收命令中的key
+        std::string getKey;//getkey用于接收isGetRequest传回的命令中的key
+        //判断是不是 GET 请求,
         if (isGetRequest(request, getKey)) {
             //收到 GET key 后首先查询缓存
             const auto cached = cache.getLocal(getKey);//内部调用MemoryStore::get
             if (cached.has_value()) {
-                client.output += RespEncoder::encode(
-                    RespValue::bulkString(*cached)
+                client.output += RespEncoder::encode(   //封装回应内容
+                    RespValue::bulkString(*cached)      //创建批量字符串
                 );
                 continue;
             }
@@ -200,7 +202,7 @@ void processRequests(
                     [clientFd, requestId, getKey, &completions](
                         LookupResult result
                     ) mutable {//在 lambda 体内默认是 `const` 只读的,加 `mutable` 解除 const 限制，让按值捕获的变量可以被移动
-                        //调用 `notifyCompletion`，线程安全地往完成队列 `completions` 里插入一个完成项
+                        //调用 `notifyCompletion`，线程安全地往完成队列 `completions` 里插入一个完成项，并写入 eventfd
                         notifyCompletion(
                             completions,
                             //完成项是 `CacheCompletion` 结构体，里面打包了
@@ -225,8 +227,8 @@ void processRequests(
             return;
         }
 
-        const CommandResult result = executor.execute(request);
-        appendCommandResult(client, result, aof);
+        const CommandResult result = executor.execute(request);//执行命令
+        appendCommandResult(client, result, aof);//把修改命令写入 AOF,把响应编码到客户端输出缓冲区
     }
 }
 
@@ -238,7 +240,8 @@ void processCompletions(
     CacheService& cache,
     AofLog& aof
 ) {
-    std::uint64_t notifications = 0;
+    std::uint64_t notifications = 0;//清空 eventfd 通知计数
+    //一次性读取 eventfd 中的所有通知，避免重复触发 EPOLLIN 事件
     while (::read(
                completions.eventFd,
                &notifications,
@@ -249,7 +252,7 @@ void processCompletions(
     std::deque<CacheCompletion> ready;
     {
         std::lock_guard lock(completions.mutex);
-        ready.swap(completions.ready);//从完成队列取出所有结果
+        ready.swap(completions.ready);//调用 `swap` 以 O (1) 代价把整个完成队列交换到局部变量 `ready` 中；
     }
 
     for (CacheCompletion& completion : ready) {
@@ -264,11 +267,11 @@ void processCompletions(
             *client.pendingRequestId != completion.requestId) {
             continue;
         }
-        client.pendingRequestId.reset();
+        client.pendingRequestId.reset();//清除挂起请求编号，表示回源完成
 
         if (completion.result.status == LookupResult::Status::Found) {
             // 回源成功后回填内存；即使 value 太大无法缓存，也仍把结果返回给客户端。
-            static_cast<void>(cache.set(
+            static_cast<void>(cache.setFromBackend(
                 completion.key,
                 completion.result.value
             ));//将数据写入内存；更新当前内存使用量；更新 LRU 链表；必要时淘汰旧数据；处理过期时间。
@@ -277,10 +280,12 @@ void processCompletions(
                 RespValue::bulkString(completion.result.value)
             );
         } else if (completion.result.status == LookupResult::Status::NotFound) {
+            //回源未命中，将空值编码为 RESP 并写入客户端输出缓冲区
             client.output += RespEncoder::encode(
                 RespValue::nullBulkString()
             );
         } else {
+            //回源失败，将错误信息编码为 RESP 并写入客户端输出缓冲区
             client.output += RespEncoder::encode(
                 RespValue::error(
                     "ERR cache backend: " + completion.result.error
@@ -289,6 +294,7 @@ void processCompletions(
         }
 
         // 一个客户端同一时间只挂起一个回源请求，保证 RESP 响应顺序。
+        //用 processRequests 继续处理客户端输入缓冲区里排队的下一条命令
         processRequests(
             client,
             executor,
@@ -297,15 +303,15 @@ void processCompletions(
             completions
         );
 
-        if ((client.peerClosed || client.closeAfterWrite) &&
-            client.output.empty() &&
-            !client.pendingRequestId.has_value()) {
-            poller.remove(completion.clientFd);
+        if ((client.peerClosed || client.closeAfterWrite) &&//对端已经关闭连接，或者客户端执行了 QUIT 命令要求写完就关闭
+            client.output.empty() &&                        //输出缓冲区已经全部发完
+            !client.pendingRequestId.has_value()) {         //没有挂起的异步请求
+            poller.remove(completion.clientFd);             //从 epoll 中移除这个客户端，并从 clients 中删除它。
             clients.erase(clientIt);
             std::cout << "client disconnected\n";
             continue;
         }
-
+        //如果客户端输出缓冲区不为空，那么就注册 EPOLLOUT 事件，以便在 socket 可写时发送数据
         std::uint32_t interest = EPOLLIN | EPOLLRDHUP | EPOLLERR;
         if (!client.output.empty()) {
             interest |= EPOLLOUT;
@@ -369,17 +375,17 @@ void writeAvailable(ClientConnection& client) {
             client.output.data(),
             client.output.size()
         );
-
+        //实际发送的字节数
         if (count > 0) {
             client.output.erase(0, static_cast<std::size_t>(count));
             continue;
         }
-
+        //本次没有发送数据
         if (count == 0) {
             client.peerClosed = true;
             return;
         }
-
+        //发送失败
         if (errno == EINTR) {
             continue;
         }
@@ -417,11 +423,16 @@ int main() {
         }
         completions.eventFd = completionFd.get();
 
-        CacheService cache(
-            store,
-            repository,
-            kCacheWorkerCount
-        );
+        CacheOptions cacheOptions;
+        cacheOptions.workerCount = kCacheWorkerCount;
+        cacheOptions.maxPendingLookups = 1024;
+        cacheOptions.maxWaitersPerKey = 1024;
+        cacheOptions.negativeCacheTtl = std::chrono::seconds(10);
+        cacheOptions.backendCacheTtl = std::chrono::seconds(60);
+        cacheOptions.backendCacheJitter = std::chrono::seconds(10);
+        cacheOptions.backendFailureThreshold = 5;
+        cacheOptions.circuitCooldown = std::chrono::seconds(5);
+        CacheService cache(store, repository, cacheOptions);
         CommandExecutor executor(cache);
         AofLog aof("data/appendonly.aof");
         aof.replay(executor);
@@ -440,20 +451,31 @@ int main() {
         std::cout << "RESP epoll server listening on 127.0.0.1:6379\n";
 
         while (true) {
-            for (const EpollPoller::Event event : poller.wait()) {
-                //查询完成
+            const auto events = poller.wait();
+
+            // 优先处理回源完成事件，在读取新的 GET 前先完成缓存回填。
+            // 这样同一个 key 的新请求可以直接命中刚回填的 MemoryStore。
+            for (const EpollPoller::Event event : events) {
                 if (event.fd == completionFd.get()) {
+                    //把后台 MySQL 线程完成的结果重新交给客户端
                     processCompletions(
-                        completions,
-                        poller,
-                        clients,
-                        executor,
-                        cache,
-                        aof
+                        completions,//回源完成队列
+                        poller,     //epoll 事件管理器
+                        clients,    //所有已连接客户端
+                        executor,   //命令执行器
+                        cache,      //缓存服务
+                        aof         //AOF 持久化日志
                     );
+                    break;
+                }
+            }
+
+            for (const EpollPoller::Event event : events) {
+                //跳过已经处理过的回源完成事件，继续处理本批次中的其他 socket 事件。
+                if (event.fd == completionFd.get()) {
                     continue;
                 }
-
+                //处理新连接事件
                 if (event.fd == listenSocket.fd()) {
                     while (true) {
                         auto accepted = listenSocket.acceptNonBlocking();
@@ -483,7 +505,7 @@ int main() {
                     }
                     continue;
                 }
-
+                //处理客户端 socket 事件
                 const auto clientIt = clients.find(event.fd);
                 if (clientIt == clients.end()) {
                     continue;
@@ -493,10 +515,10 @@ int main() {
                 client.peerClosed = client.peerClosed ||
                     (event.events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
 
-                // 等待回源时暂停读取，避免响应顺序被后续请求打乱。
-                if ((event.events & EPOLLIN) != 0 &&
-                    !client.closeAfterWrite &&
-                    !client.pendingRequestId.has_value()) {
+                // 有数据可读，但等待回源时暂停读取，避免响应顺序被后续请求打乱。
+                if ((event.events & EPOLLIN) != 0 &&        //有数据可读
+                    !client.closeAfterWrite &&              //客户端没有关闭连接
+                    !client.pendingRequestId.has_value()) { //当前客户端没有挂起的回源请求
                     readAvailable(
                         client,
                         executor,
@@ -506,11 +528,12 @@ int main() {
                     );
                 }
 
+                //有数据可写，或者输出缓冲区不为空，就尝试写入客户端
                 if ((event.events & EPOLLOUT) != 0 ||
                     !client.output.empty()) {
                     writeAvailable(client);
                 }
-
+                //如果客户端已经关闭连接，或者输出缓冲区为空且没有挂起的回源请求，就移除客户端
                 if ((client.peerClosed || client.closeAfterWrite) &&
                     client.output.empty() &&
                     !client.pendingRequestId.has_value()) {
@@ -519,7 +542,7 @@ int main() {
                     std::cout << "client disconnected\n";
                     continue;
                 }
-
+                //更新客户端 socket 的事件兴趣集，继续监听 EPOLLIN、EPOLLRDHUP、EPOLLERR，如果输出缓冲区不为空就监听 EPOLLOUT
                 std::uint32_t interest = EPOLLIN | EPOLLRDHUP | EPOLLERR;
                 if (!client.output.empty()) {
                     interest |= EPOLLOUT;

@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,6 +42,28 @@ std::optional<std::int64_t> parseInteger(std::string_view text) {
         return std::nullopt;
     }
     return value;
+}
+
+std::optional<std::int64_t> addIntegers(
+    std::int64_t left,
+    std::int64_t right
+) noexcept {
+    if ((right > 0 && left > std::numeric_limits<std::int64_t>::max() - right) ||
+        (right < 0 && left < std::numeric_limits<std::int64_t>::min() - right)) {
+        return std::nullopt;
+    }
+    return left + right;
+}
+
+std::optional<std::int64_t> subtractIntegers(
+    std::int64_t left,
+    std::int64_t right
+) noexcept {
+    if ((right > 0 && left < std::numeric_limits<std::int64_t>::min() + right) ||
+        (right < 0 && left > std::numeric_limits<std::int64_t>::max() + right)) {
+        return std::nullopt;
+    }
+    return left - right;
 }
 
 //把若干个 RespValue 参数组合成一个 RESP 数组命令
@@ -108,6 +132,27 @@ CommandResult CommandExecutor::execute(
         return result;
     }
 
+    if (command == "EXISTS") {
+        if (request.elements.size() < 2) {
+            result.response = RespValue::error(
+                "ERR wrong number of arguments for 'exists'"
+            );
+            return result;
+        }
+
+        // Redis 对重复 key 只统计一次。
+        std::unordered_set<std::string> seen;
+        std::int64_t existing = 0;
+        for (std::size_t index = 1; index < request.elements.size(); ++index) {
+            const std::string& key = request.elements[index].text;
+            if (seen.insert(key).second && cache_.exists(key)) {
+                ++existing;
+            }
+        }
+        result.response = RespValue::integerValue(existing);
+        return result;
+    }
+
     if (command == "SET") {
         // 1. 参数数量校验
         if (request.elements.size() != 3) {
@@ -149,6 +194,106 @@ CommandResult CommandExecutor::execute(
         result.response = value.has_value()
             ? RespValue::bulkString(*value)
             : RespValue::nullBulkString();
+        return result;
+    }
+
+    if (command == "MGET") {
+        if (request.elements.size() < 2) {
+            result.response = RespValue::error(
+                "ERR wrong number of arguments for 'mget'"
+            );
+            return result;
+        }
+
+        std::vector<RespValue> values;
+        values.reserve(request.elements.size() - 1);
+        for (std::size_t index = 1; index < request.elements.size(); ++index) {
+            const auto value = cache_.getLocal(request.elements[index].text);
+            values.push_back(
+                value.has_value()
+                    ? RespValue::bulkString(*value)
+                    : RespValue::nullBulkString()
+            );
+        }
+        result.response = RespValue::array(std::move(values));
+        return result;
+    }
+
+    if (command == "INCR" || command == "INCRBY" ||
+        command == "DECR" || command == "DECRBY") {
+        const bool hasAmount = command == "INCRBY" || command == "DECRBY";
+        if ((!hasAmount && request.elements.size() != 2) ||
+            (hasAmount && request.elements.size() != 3)) {
+            result.response = RespValue::error(
+                std::string("ERR wrong number of arguments for '") +
+                (command == "INCR" ? "incr" :
+                    command == "INCRBY" ? "incrby" :
+                    command == "DECR" ? "decr" : "decrby") + "'"
+            );
+            return result;
+        }
+
+        const bool decrement = command == "DECR" || command == "DECRBY";
+        std::int64_t amount = 1;
+        if (hasAmount) {
+            const auto parsedDelta = parseInteger(request.elements[2].text);
+            if (!parsedDelta.has_value()) {
+                result.response = RespValue::error(
+                    "ERR value is not an integer or out of range"
+                );
+                return result;
+            }
+            amount = *parsedDelta;
+        }
+
+        const auto currentValue = cache_.getLocal(request.elements[1].text);
+        std::int64_t current = 0;
+        if (currentValue.has_value()) {
+            const auto parsedCurrent = parseInteger(*currentValue);
+            if (!parsedCurrent.has_value()) {
+                result.response = RespValue::error(
+                    "ERR value is not an integer or out of range"
+                );
+                return result;
+            }
+            current = *parsedCurrent;
+        }
+
+        const auto next = decrement
+            ? subtractIntegers(current, amount)
+            : addIntegers(current, amount);
+        if (!next.has_value()) {
+            result.response = RespValue::error(
+                "ERR increment or decrement would overflow"
+            );
+            return result;
+        }
+
+        // INCR/INCRBY 修改 value 时保留已有 TTL。
+        const auto expiration = cache_.expirationMilliseconds(
+            request.elements[1].text
+        );
+        const auto setResult = cache_.set(
+            request.elements[1].text,
+            std::to_string(*next)
+        );
+        if (setResult == cache::CacheService::SetResult::RejectedByMaxMemory) {
+            result.response = RespValue::error(
+                "OOM command not allowed when used memory > 'maxmemory'"
+            );
+            return result;
+        }
+        if (expiration.has_value()) {
+            static_cast<void>(cache_.expireAtMilliseconds(
+                request.elements[1].text,
+                *expiration
+            ));
+        }
+
+        result.response = RespValue::integerValue(*next);
+        if (record) {
+            result.persistenceCommands.push_back(request);
+        }
         return result;
     }
 

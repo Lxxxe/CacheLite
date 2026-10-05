@@ -8,7 +8,7 @@ namespace cachelite::protocol {
 
 RespParseStatus RespParser::parse(
     net::Buffer& input,
-    RespValue& value,
+    RespValue& value,//传出解析后并封装好RESP数据类型的结构体
     std::string& error
 ) const {
     error.clear();
@@ -55,7 +55,7 @@ RespParser::ParseResult RespParser::parseValue(
 
     //读取 RESP 类型前缀字节，同时 offset 后移一位
     const char prefix = input[offset++];
-    std::string_view line;
+    std::string_view line;//用于接收readLine解析出的命令
 
     switch (prefix) {
     //简单字符串（Simple String）
@@ -65,7 +65,7 @@ RespParser::ParseResult RespParser::parseValue(
         if (result != ParseResult::Complete) {
             return result;
         }
-        //封装成简单字符串类型的 `RespValue`
+        //将line封装成简单字符串类型的 `RespValue`
         value = RespValue::simpleString(std::string(line));
         return ParseResult::Complete;
     }
@@ -75,7 +75,7 @@ RespParser::ParseResult RespParser::parseValue(
         if (result != ParseResult::Complete) {
             return result;
         }
-
+        //将line封装成错误类型的 `RespValue`
         value = RespValue::error(std::string(line));
         return ParseResult::Complete;
     }
@@ -188,11 +188,11 @@ RespParser::ParseResult RespParser::parseValue(
         return ParseResult::Error;
     }
 }
-
+//读取 RESP 协议中的“一行协议头”
 RespParser::ParseResult RespParser::readLine(
-    std::string_view input,
-    std::size_t& offset,
-    std::string_view& line,
+    std::string_view input, //当前 Buffer 中尚未消费的全部输入数据
+    std::size_t& offset,    //当前解析位置
+    std::string_view& line, //输出读取到的内容
     std::string& error
 ) {
     //从 `offset` 位置开始，在输入缓冲区中查找第一个 `\r\n` 的起始下标
