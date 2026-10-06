@@ -72,6 +72,22 @@ chmod +x scripts/build.sh
 ./scripts/build.sh debug
 ```
 
+RESP 服务端支持通过环境变量选择 AOF 持久化策略：
+
+```bash
+# 每条修改命令都 flush 并 fsync，最安全，写性能最低
+CACHELITE_AOF_POLICY=always ./build-wsl/cachelite_resp_epoll
+
+# 后台每秒 flush 并 fsync，默认策略
+CACHELITE_AOF_POLICY=everysec ./build-wsl/cachelite_resp_epoll
+
+# 只依赖操作系统文件缓冲，写性能最高，但异常断电可能丢失最近数据
+CACHELITE_AOF_POLICY=no ./build-wsl/cachelite_resp_epoll
+```
+
+如果未设置 `CACHELITE_AOF_POLICY`，默认使用 `everysec`。服务器启动时会打印
+当前策略。`always` 和 `everysec` 会在正常退出时执行最后一次 flush 和 fsync。
+
 预期输出：
 
 ```text

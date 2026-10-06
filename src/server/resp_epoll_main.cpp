@@ -434,7 +434,8 @@ int main() {
         cacheOptions.circuitCooldown = std::chrono::seconds(5);
         CacheService cache(store, repository, cacheOptions);
         CommandExecutor executor(cache);
-        AofLog aof("data/appendonly.aof");
+        const auto aofPolicy = AofLog::policyFromEnvironment();
+        AofLog aof("data/appendonly.aof", aofPolicy);
         aof.replay(executor);
 
         Socket listenSocket;
@@ -448,7 +449,9 @@ int main() {
         poller.add(completionFd.get(), EPOLLIN);
         std::unordered_map<int, ClientConnection> clients;
 
-        std::cout << "RESP epoll server listening on 127.0.0.1:6379\n";
+        std::cout << "RESP epoll server listening on 127.0.0.1:6379\n"
+                  << "AOF fsync policy: "
+                  << AofLog::policyName(aofPolicy) << '\n';
 
         while (true) {
             const auto events = poller.wait();

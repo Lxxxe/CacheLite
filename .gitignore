@@ -3,6 +3,9 @@
 /build-wsl/
 /build-debug/
 /build-mysql/
+/build-tests*/
+/build-stress*/
+/build-release*/
 /out/
 /bin/
 /lib/
@@ -14,6 +17,7 @@
 CMakeUserPresets.json
 *.user
 *.suo
+__pycache__/
 
 # Runtime files
 *.log
