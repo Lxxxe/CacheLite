@@ -76,8 +76,9 @@ def run_worker(
     port: int,
     requests: int,
     pipeline: int,
-    request: bytes,
-    responses_per_operation: int,
+    operations: list[tuple[bytes, tuple[bytes, ...]]],
+    worker_index: int,
+    client_count: int,
     timeout: float,
 ) -> WorkerResult:
     completed_operations = 0
@@ -90,18 +91,31 @@ def run_worker(
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with sock.makefile("rb") as reader:
             remaining = requests
+            processed = 0
             while remaining:
                 batch_size = min(pipeline, remaining)
-                payload = request * batch_size
-                expected_responses = batch_size * responses_per_operation
+                selected = [
+                    operations[
+                        (worker_index + (processed + offset) * client_count)
+                        % len(operations)
+                    ]
+                    for offset in range(batch_size)
+                ]
+                payload = b"".join(request for request, _ in selected)
+                expected = [
+                    response
+                    for _, responses in selected
+                    for response in responses
+                ]
+                expected_responses = len(expected)
                 started = time.perf_counter_ns()
                 try:
                     sock.sendall(payload)
                     responses_read = 0
                     batch_errors = 0
-                    for _ in range(expected_responses):
+                    for correct in expected:
                         response = read_resp(reader)
-                        if response.startswith(b"-"):
+                        if response != correct:
                             batch_errors += 1
                         responses_read += 1
                     completed_commands += responses_read - batch_errors
@@ -117,6 +131,7 @@ def run_worker(
                     errors += batch_errors + expected_responses - responses_read
                     break
                 remaining -= batch_size
+                processed += batch_size
 
     return WorkerResult(
         completed_operations,
@@ -153,28 +168,57 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--key", default="bench:key")
     parser.add_argument("--value", default="bench:value")
+    parser.add_argument(
+        "--keyspace", type=int, default=1,
+        help="number of different keys; GET keys are preloaded before timing",
+    )
     args = parser.parse_args()
-    if args.clients < 1 or args.requests < 1 or args.pipeline < 1:
-        parser.error("clients, requests and pipeline must be positive")
+    if (args.clients < 1 or args.requests < 1 or args.pipeline < 1 or
+            args.keyspace < 1):
+        parser.error("clients, requests, pipeline and keyspace must be positive")
     return args
+
+
+def preload_keys(args: argparse.Namespace, keys: list[str]) -> None:
+    with socket.create_connection((args.host, args.port),
+                                  timeout=args.timeout) as sock:
+        sock.settimeout(args.timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        with sock.makefile("rb") as reader:
+            for offset in range(0, len(keys), 128):
+                batch = keys[offset:offset + 128]
+                sock.sendall(b"".join(
+                    command("SET", key, args.value) for key in batch
+                ))
+                for _ in batch:
+                    if read_resp(reader) != b"+OK\r\n":
+                        raise RuntimeError("GET key preload failed")
 
 
 def main() -> int:
     args = parse_args()
-    if args.command == "ping":
-        request = command("PING")
-        responses_per_operation = 1
-    elif args.command == "set":
-        request = command("SET", args.key, args.value)
-        responses_per_operation = 1
-    elif args.command == "get":
-        request = command("GET", args.key)
-        responses_per_operation = 1
-    else:
-        request = command("SET", args.key, args.value) + command(
-            "GET", args.key
-        )
-        responses_per_operation = 2
+    keys = [
+        args.key if args.keyspace == 1 else f"{args.key}:{index}"
+        for index in range(args.keyspace)
+    ]
+    operations = []
+    for key in keys:
+        if args.command == "ping":
+            operations.append((command("PING"), (b"+PONG\r\n",)))
+        elif args.command == "set":
+            operations.append((
+                command("SET", key, args.value), (b"+OK\r\n",)
+            ))
+        elif args.command == "get":
+            operations.append((command("GET", key), (bulk(args.value),)))
+        else:
+            operations.append((
+                command("SET", key, args.value) + command("GET", key),
+                (b"+OK\r\n", bulk(args.value)),
+            ))
+
+    if args.command == "get":
+        preload_keys(args, keys)
 
     client_count = min(args.clients, args.requests)
     request_counts = [args.requests // client_count] * client_count
@@ -190,11 +234,12 @@ def main() -> int:
                 args.port,
                 count,
                 args.pipeline,
-                request,
-                responses_per_operation,
+                operations,
+                index,
+                client_count,
                 args.timeout,
             )
-            for count in request_counts
+            for index, count in enumerate(request_counts)
         ]
         results = [future.result() for future in futures]
     elapsed = time.perf_counter() - started
@@ -222,11 +267,11 @@ def main() -> int:
     print(f"clients:       {client_count}")
     print(f"pipeline:      {args.pipeline}")
     print(f"completed:     {completed_operations}")
-    if responses_per_operation > 1:
+    if args.command == "set-get":
         print(f"commands:      {completed_commands}")
     print(f"errors:        {errors}")
     print(f"elapsed:       {elapsed:.3f} s")
-    if responses_per_operation > 1:
+    if args.command == "set-get":
         print(f"TPS:           {operations_per_second:.2f}")
         print(f"command QPS:   {commands_per_second:.2f}")
     else:

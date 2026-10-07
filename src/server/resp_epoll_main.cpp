@@ -13,14 +13,17 @@
 
 #include <array>
 #include <chrono>
+#include <charconv>
 #include <cerrno>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -48,6 +51,22 @@ using cachelite::protocol::RespParseStatus;
 using cachelite::protocol::RespParser;
 using cachelite::protocol::RespValue;
 using cachelite::storage::MemoryStore;
+
+std::uint16_t listenPortFromEnvironment() {
+    const char* value = std::getenv("CACHELITE_PORT");
+    if (value == nullptr) {
+        return 6379;
+    }
+
+    unsigned int port = 0;
+    const char* end = value + std::char_traits<char>::length(value);
+    const auto [parsedEnd, error] = std::from_chars(value, end, port);
+    if (error != std::errc{} || parsedEnd != end ||
+        port == 0 || port > 65535) {
+        throw std::invalid_argument("CACHELITE_PORT must be between 1 and 65535");
+    }
+    return static_cast<std::uint16_t>(port);
+}
 
 class FileDescriptor {
 public:
@@ -441,7 +460,8 @@ int main() {
         Socket listenSocket;
         listenSocket.setReuseAddress(true);
         listenSocket.setNonBlocking();
-        listenSocket.bind(InetAddress(6379));
+        const std::uint16_t listenPort = listenPortFromEnvironment();
+        listenSocket.bind(InetAddress(listenPort));
         listenSocket.listen();
 
         EpollPoller poller;
@@ -449,7 +469,8 @@ int main() {
         poller.add(completionFd.get(), EPOLLIN);
         std::unordered_map<int, ClientConnection> clients;
 
-        std::cout << "RESP epoll server listening on 127.0.0.1:6379\n"
+        std::cout << "RESP epoll server listening on 127.0.0.1:"
+                  << listenPort << '\n'
                   << "AOF fsync policy: "
                   << AofLog::policyName(aofPolicy) << '\n';
 

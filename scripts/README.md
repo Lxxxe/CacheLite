@@ -21,12 +21,26 @@ python3 scripts/resp_benchmark.py \
 
 脚本输出 QPS、错误数、平均 RT、P50、P95、P99 和最大 RT。
 
-测试 GET 前先写入数据：
+测试 GET：脚本会先写入测试 Key，并在计时开始前确认预填充成功；响应值不匹配或返回空值都会计入错误。
 
 ```bash
 python3 scripts/resp_benchmark.py --command set --key bench:key --value bench:value
 python3 scripts/resp_benchmark.py --command get --key bench:key --clients 100 --requests 100000
 ```
+
+测试不同 Key 的 GET（预填充 10,000 个 Key，再执行 100,000 次 GET）：
+
+```bash
+python3 scripts/resp_benchmark.py \
+  --command get \
+  --key bench:distinct \
+  --keyspace 10000 \
+  --clients 100 \
+  --requests 100000 \
+  --pipeline 16
+```
+
+预填充操作不计入 QPS 和 RT，但会写入 AOF。建议在独立测试目录运行服务端，以免基准数据混入日常 AOF。
 
 测试 SET + GET 混合业务操作：
 

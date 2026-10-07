@@ -35,20 +35,36 @@ public:
 
     LookupResult find(std::string_view key) override {
         calls_.fetch_add(1, std::memory_order_relaxed);
+        const std::size_t active = active_.fetch_add(
+            1, std::memory_order_relaxed
+        ) + 1;
+        std::size_t observed = peakActive_.load(std::memory_order_relaxed);
+        while (active > observed && !peakActive_.compare_exchange_weak(
+                   observed, active, std::memory_order_relaxed
+               )) {
+        }
         if (delay_ > std::chrono::milliseconds::zero()) {
             std::this_thread::sleep_for(delay_);
         }
-        return handler_(key);
+        LookupResult result = handler_(key);
+        active_.fetch_sub(1, std::memory_order_relaxed);
+        return result;
     }
 
     [[nodiscard]] std::size_t calls() const noexcept {
         return calls_.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] std::size_t peakActive() const noexcept {
+        return peakActive_.load(std::memory_order_relaxed);
+    }
+
 private:
     Handler handler_;
     std::chrono::milliseconds delay_;
     std::atomic<std::size_t> calls_{0};
+    std::atomic<std::size_t> active_{0};
+    std::atomic<std::size_t> peakActive_{0};
 };
 
 class BlockingRepository final : public KeyValueRepository {
@@ -225,6 +241,8 @@ void handlesManyDifferentKeysConcurrently() {
     collector.waitFor(requestCount);
 
     CACHELITE_CHECK(repository.calls() == requestCount);
+    CACHELITE_CHECK(repository.peakActive() > std::size_t{1});
+    CACHELITE_CHECK(repository.peakActive() <= options.workerCount);
     for (const LookupResult& result : collector.results()) {
         CACHELITE_CHECK(result.status == LookupResult::Status::Found);
     }
@@ -256,6 +274,69 @@ void cachesNegativeResults() {
     for (const LookupResult& result : collector.results()) {
         CACHELITE_CHECK(result.status == LookupResult::Status::NotFound);
     }
+}
+
+void fillsCacheAfterBackendMiss() {
+    FakeRepository repository([](std::string_view key) {
+        return LookupResult::found("database:" + std::string(key));
+    });
+    MemoryStore memory;
+    CacheOptions options;
+    options.workerCount = 2;
+    options.backendCacheTtl = std::chrono::seconds{60};
+    options.backendCacheJitter = std::chrono::seconds{0};
+    CacheService cache(memory, repository, options);
+    ResultCollector collector;
+
+    CACHELITE_CHECK(!cache.getLocal("cold-key").has_value());
+    cache.lookupAsync("cold-key", [&collector](LookupResult result) {
+        collector.add(std::move(result));
+    });
+    collector.waitFor(1);
+    const LookupResult result = collector.results().front();
+    CACHELITE_CHECK(result.status == LookupResult::Status::Found);
+    CACHELITE_CHECK(result.value == "database:cold-key");
+    CACHELITE_CHECK(cache.setFromBackend("cold-key", result.value) ==
+        MemoryStore::SetResult::Inserted);
+    CACHELITE_CHECK(cache.getLocal("cold-key") ==
+        std::optional<std::string>{"database:cold-key"});
+    CACHELITE_CHECK(cache.ttlSeconds("cold-key") > 0);
+    CACHELITE_CHECK(repository.calls() == std::size_t{1});
+}
+
+void preventsRepeatedPenetrationUntilNegativeTtlExpires() {
+    FakeRepository repository([](std::string_view) {
+        return LookupResult::notFound();
+    });
+    MemoryStore memory;
+    CacheOptions options;
+    options.workerCount = 1;
+    options.negativeCacheTtl = std::chrono::seconds{1};
+    CacheService cache(memory, repository, options);
+    ResultCollector collector;
+
+    cache.lookupAsync("absent-key", [&collector](LookupResult result) {
+        collector.add(std::move(result));
+    });
+    collector.waitFor(1);
+    constexpr std::size_t repeatCount = 1000;
+    for (std::size_t index = 0; index < repeatCount; ++index) {
+        cache.lookupAsync("absent-key", [&collector](LookupResult result) {
+            collector.add(std::move(result));
+        });
+    }
+    collector.waitFor(repeatCount + 1);
+    CACHELITE_CHECK(repository.calls() == std::size_t{1});
+    for (const LookupResult& result : collector.results()) {
+        CACHELITE_CHECK(result.status == LookupResult::Status::NotFound);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    cache.lookupAsync("absent-key", [&collector](LookupResult result) {
+        collector.add(std::move(result));
+    });
+    collector.waitFor(repeatCount + 2);
+    CACHELITE_CHECK(repository.calls() == std::size_t{2});
 }
 
 void opensCircuitAfterBackendFailures() {
@@ -331,6 +412,8 @@ int main() {
             {"merges concurrent lookups for one key", mergesConcurrentLookupsForOneKey},
             {"handles many different keys concurrently", handlesManyDifferentKeysConcurrently},
             {"caches negative results", cachesNegativeResults},
+            {"fills cache after backend miss", fillsCacheAfterBackendMiss},
+            {"prevents repeated penetration until negative TTL expires", preventsRepeatedPenetrationUntilNegativeTtlExpires},
             {"opens circuit after backend failures", opensCircuitAfterBackendFailures},
             {"rejects excess waiting requests", rejectsExcessWaitingRequests},
         }

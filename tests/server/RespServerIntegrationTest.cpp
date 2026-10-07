@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -23,16 +24,74 @@
 
 namespace {
 
-constexpr std::uint16_t kPort = 6379;
+std::uint16_t testPort = 0;
+
+std::uint16_t chooseFreePort() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        throw std::runtime_error(std::strerror(errno));
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) < 0) {
+        ::close(fd);
+        throw std::runtime_error("cannot allocate test port");
+    }
+    socklen_t length = sizeof(address);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) < 0) {
+        ::close(fd);
+        throw std::runtime_error("getsockname failed");
+    }
+    ::close(fd);
+    return ntohs(address.sin_port);
+}
+
+class TempWorkingDirectory final {
+public:
+    TempWorkingDirectory()
+        : original_(std::filesystem::current_path()),
+          path_(std::filesystem::temp_directory_path() /
+                ("cachelite-server-test-" + std::to_string(::getpid()) + "-" +
+                 std::to_string(std::chrono::steady_clock::now()
+                                    .time_since_epoch().count()))) {
+        if (!std::filesystem::create_directory(path_)) {
+            throw std::runtime_error("temporary test directory already exists");
+        }
+        std::filesystem::create_directory(path_ / "data");
+        std::filesystem::current_path(path_);
+    }
+
+    TempWorkingDirectory(const TempWorkingDirectory&) = delete;
+    TempWorkingDirectory& operator=(const TempWorkingDirectory&) = delete;
+
+    ~TempWorkingDirectory() {
+        std::error_code error;
+        std::filesystem::current_path(original_, error);
+        std::filesystem::remove_all(path_, error);
+    }
+
+private:
+    std::filesystem::path original_;
+    std::filesystem::path path_;
+};
 
 class ChildProcess final {
 public:
-    explicit ChildProcess(const std::string& executable) {
+    explicit ChildProcess(
+        const std::string& executable,
+        const char* aofPolicy = "everysec"
+    ) {
         pid_ = ::fork();
         if (pid_ < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
         if (pid_ == 0) {
+            const std::string portText = std::to_string(testPort);
+            ::setenv("CACHELITE_PORT", portText.c_str(), 1);
+            ::setenv("CACHELITE_AOF_POLICY", aofPolicy, 1);
             const int nullFd = ::open("/dev/null", O_WRONLY);
             if (nullFd >= 0) {
                 ::dup2(nullFd, STDOUT_FILENO);
@@ -85,7 +144,7 @@ int connectToServer() {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(kPort);
+    address.sin_port = htons(testPort);
     const int converted = ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
     if (converted != 1) {
         ::close(fd);
@@ -171,14 +230,7 @@ std::string requestFor(std::size_t index) {
 }
 
 void servesManyConcurrentClients(const std::string& serverPath) {
-    const std::filesystem::path originalDirectory =
-        std::filesystem::current_path();
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    const std::filesystem::path workDirectory =
-        std::filesystem::temp_directory_path() /
-        ("cachelite-server-test-" + std::to_string(now));
-    std::filesystem::create_directories(workDirectory / "data");
-    std::filesystem::current_path(workDirectory);
+    TempWorkingDirectory workDirectory;
 
     ChildProcess server(serverPath);
     bool ready = false;
@@ -234,10 +286,57 @@ void servesManyConcurrentClients(const std::string& serverPath) {
     }
 
     server.stop();
-    std::filesystem::current_path(originalDirectory);
-    std::error_code cleanupError;
-    std::filesystem::remove_all(workDirectory, cleanupError);
     CACHELITE_CHECK(failures.empty());
+}
+
+void waitForServer() {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (canConnect()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    throw std::runtime_error("server did not start");
+}
+
+std::string exchangeAndClose(const std::string& request) {
+    const int fd = connectToServer();
+    try {
+        sendAll(fd, request);
+        ::shutdown(fd, SHUT_WR);
+        std::string response = receiveUntilClose(fd);
+        ::close(fd);
+        return response;
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+}
+
+void recoversAofAfterProcessRestart(const std::string& serverPath) {
+    for (const char* policy : {"always", "everysec"}) {
+        TempWorkingDirectory workDirectory;
+        {
+            ChildProcess server(serverPath, policy);
+            waitForServer();
+            const std::string response = exchangeAndClose(
+                "*3\r\n$3\r\nSET\r\n$7\r\naof:key\r\n$5\r\nvalue\r\n"
+            );
+            CACHELITE_CHECK(response == "+OK\r\n");
+            if (std::string(policy) == "everysec") {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1200});
+            }
+            server.stop();
+        }
+        {
+            ChildProcess restarted(serverPath, policy);
+            waitForServer();
+            const std::string response = exchangeAndClose(
+                "*2\r\n$3\r\nGET\r\n$7\r\naof:key\r\n"
+            );
+            CACHELITE_CHECK(response == "$5\r\nvalue\r\n");
+        }
+    }
 }
 
 }  // namespace
@@ -247,11 +346,15 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    testPort = chooseFreePort();
     return cachelite::test::runSuite(
         "RESP server integration",
         std::vector<std::pair<std::string, std::function<void()>>>{
             {"serves many concurrent clients", [argv] {
                 servesManyConcurrentClients(argv[1]);
+            }},
+            {"recovers AOF after process restart", [argv] {
+                recoversAofAfterProcessRestart(argv[1]);
             }},
         }
     );

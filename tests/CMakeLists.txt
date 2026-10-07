@@ -66,6 +66,32 @@ add_test(
     COMMAND cachelite_database_test
 )
 
+if(CACHELITE_ENABLE_MYSQL)
+    add_executable(cachelite_mysql_integration_test
+        database/MySQLIntegrationTest.cpp
+    )
+
+    target_link_libraries(cachelite_mysql_integration_test
+        PRIVATE
+            cachelite_cache
+            Threads::Threads
+    )
+
+    cachelite_set_warnings(cachelite_mysql_integration_test)
+    cachelite_enable_sanitizers(cachelite_mysql_integration_test)
+
+    add_test(
+        NAME cachelite.database.mysql_live
+        COMMAND cachelite_mysql_integration_test
+    )
+    set_tests_properties(
+        cachelite.database.mysql_live
+        PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 30
+    )
+endif()
+
 add_executable(cachelite_command_test
     command/CommandExecutorTest.cpp
 )
@@ -141,5 +167,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             TIMEOUT 30
             RESOURCE_LOCK cachelite_resp_server_port
     )
+
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME cachelite.server.benchmark_smoke
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/server/BenchmarkSmokeTest.py
+                $<TARGET_FILE:cachelite_resp_epoll>
+                ${PROJECT_SOURCE_DIR}/scripts/resp_benchmark.py
+        )
+        set_tests_properties(
+            cachelite.server.benchmark_smoke
+            PROPERTIES TIMEOUT 30
+        )
+    endif()
 endif()
 
